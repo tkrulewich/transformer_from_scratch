@@ -1,10 +1,12 @@
 import datetime
+import os
 import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 from tqdm import tqdm
+from torch.optim.lr_scheduler import StepLR
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -22,7 +24,7 @@ class AttentionHead(nn.Module):
 
         self.register_buffer('tril_mask', torch.tril(torch.ones(self.MAX_SEQ_LEN, self.MAX_SEQ_LEN)).to(device))
     
-    def forward(self, x):
+    def forward(self, x, mask=None):
         batch_size, seq_len, d_model = x.size()
 
         k = self.key(x)       # (batch, seq_len, d_model) -> (batch, seq_len, d_feature)
@@ -37,6 +39,11 @@ class AttentionHead(nn.Module):
 
         # Normalize the attention weights by dividing by the square root of the feature dimension
         attention = attention / (d_model ** 0.5)
+
+        if mask is not None:
+            # Expand the mask to match the attention shape (batch_size, 1, seq_len)
+            mask = mask.unsqueeze(1).expand(batch_size, seq_len, seq_len)
+            attention = attention.masked_fill(mask, float('-inf'))
 
         # Use softmax to get the normalized attention weights from 0 to 1
         attention = torch.softmax(attention, dim=-1)
@@ -57,13 +64,13 @@ class MultiHeadAttention(nn.Module):
         self.heads = nn.Sequential(*[AttentionHead(d_model, d_feature, dropout) for _ in range(n_heads)])
 
         self.linear = nn.Linear(d_model, d_model)
+
+        self.dropout = nn.Dropout(dropout)
     
-    def forward(self, x):
-        # Apply each head to the input
-        # Concatenate the outputs of each head
-        # Apply a linear layer
-        x = torch.cat([head(x) for head in self.heads], dim=-1)
+    def forward(self, x, mask=None):
+        x = torch.cat([head(x, mask) for head in self.heads], dim=-1)
         x = self.linear(x)
+        x = self.dropout(x)
         return x
 
 class LayerNorm(nn.Module):
@@ -80,6 +87,24 @@ class LayerNorm(nn.Module):
 
         return self.gamma * (x - mean) / torch.sqrt(std ** 2 + self.eps) + self.bias
 
+class MLP(nn.Module):
+    def __init__(self, d_model, intermediate, dropout=0.1):
+        super().__init__()
+
+        self.gate_proj = nn.Linear(d_model, intermediate, bias=False)
+        self.up_proj = nn.Linear(d_model, intermediate, bias=False)
+        self.down_proj = nn.Linear(intermediate, d_model, bias=False)
+
+        self.activation = nn.GELU()
+
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        down_proj = self.down_proj(self.activation(self.gate_proj(x)) * self.up_proj(x))
+
+        return self.dropout(down_proj)
+
+
 class EncoderBlock(nn.Module):
     def __init__(self, d_model, n_heads):
         super().__init__()
@@ -88,16 +113,25 @@ class EncoderBlock(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model),
-            nn.ReLU(),
-            nn.Linear(4 * d_model, d_model)
-        )
+        self.mlp = MLP(d_model, d_model * 4)
+    def forward(self, x, mask=None):
+        hidden_states = x
+        residual = hidden_states
+
+        # input normalization
+        hidden_states = self.norm1(hidden_states)
+
+        hidden_states = self.attention(hidden_states, mask)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
     
-    def forward(self, x):
-        x = self.norm1(self.attention(x)) + x
-        x = self.norm2(self.mlp(x)) + x
-        return x
+        hidden_states = self.norm2(hidden_states)
+
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
 
 class Encoder(nn.Module):
     def __init__(self, vocab_size, d_model, n_heads, n_layers):
@@ -106,9 +140,10 @@ class Encoder(nn.Module):
         self.vocab_size = vocab_size
 
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.register_buffer('positional_embedding', self._positional_encoding(d_model))
+        # self.register_buffer('positional_embedding', self._positional_encoding(d_model))
+        self.positional_embedding = nn.Embedding(AttentionHead.MAX_SEQ_LEN, d_model)
 
-        self.layers = nn.Sequential(*[EncoderBlock(d_model, n_heads) for _ in range(n_layers)])
+        self.layers = nn.ModuleList([EncoderBlock(d_model, n_heads) for _ in range(n_layers)])
 
         self.ln = nn.LayerNorm(d_model)
 
@@ -127,8 +162,15 @@ class Encoder(nn.Module):
     def forward(self, x, targets=None):
         batch_size, seq_len = x.size()
 
-        x = self.embedding(x) + self.positional_embedding[:seq_len]
-        x = self.layers(x)
+        mask = x == 50256
+        masked_token_count = mask.sum()
+
+        pos = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1).to(device)
+        x = self.embedding(x) + self.positional_embedding(pos)
+
+        # x = self.layers(x, kwargs={'mask': mask})
+        for layer in self.layers:
+            x = layer(x, mask)
         x = self.ln(x)
 
         logits = self.lm_head(x)
@@ -154,7 +196,7 @@ class Encoder(nn.Module):
                 logits = logits[:, -1, :]                           # (batch, vocab_size)
 
                 temperature = 0.7
-                top_k = 2
+                top_k = 5
                 logits = logits / temperature
 
                 if top_k > 0:
@@ -168,108 +210,121 @@ class Encoder(nn.Module):
 
                 next = torch.multinomial(probs, num_samples=1)  # (batch, 1)
 
+                # if the next token is the padding token, break
+                if next.item() == 50256:
+                    break
+
                 x = torch.cat([x, next], dim=1)             # (batch, seq_len + 1)
 
 
             return x
 
-class Tokenizer:
-    def __init__(self, chars):
-        self.char_to_ix = {ch: i for i, ch in enumerate(chars)}
-        self.ix_to_char = {i: ch for i, ch in enumerate(chars)}
-    
-    def char_to_index(self, ch):
-        return self.char_to_ix[ch]
-    
-    def index_to_char(self, ix):
-        return self.ix_to_char[ix]
-
-    def encode(self, text):
-        return [self.char_to_index(ch) for ch in text]
-    
-    def decode(self, indices):
-        return ''.join([self.index_to_char(ix) for ix in indices])
-
-
 from datasets import load_dataset
-
-# This takes a few minutes to run, so go grab a tea or coffee while you wait :)
-data_files = "https://huggingface.co/datasets/reddit_tifu/resolve/main/data/tifu_all_tokenized_and_filtered.json.gz"
-text = load_dataset("json", data_files=data_files, split="train")["selftext"]
-
 
 tokenizer = AutoTokenizer.from_pretrained("gpt2", device=device)
 vocab_size = tokenizer.vocab_size
-training = False
+training = True
 
 if training:
     model = Encoder(vocab_size, 512, 16, 16)
+    # load the model
+    # model.load_state_dict(torch.load('model_step_30000.pth'))
 
     model = model.to(device)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    from sklearn.model_selection import train_test_split
-    train_data, test_data = train_test_split(text, test_size=0.1)
+    batch_count = {}
+    from datatrove.pipeline.readers import ParquetReader
+    # https://huggingface.co/datasets/HuggingFaceFW/fineweb/tree/main/data
 
-    import random
-    def get_batch(data, batch_size, seq_len):
-        indices = random.sample(range(len(data)), batch_size)
+    data_reader = ParquetReader("hf://datasets/HuggingFaceGECLM/REDDIT_comments/data", text_key = "body", shuffle_files=True)()
 
-        text = [data[i] for i in indices]
-        tokens = tokenizer(text, return_tensors='pt', padding=True, truncation=True, max_length=seq_len + 1)['input_ids'].to(device)
+    token_buffer = []
 
-        x = tokens[:, :-1]
-        y = tokens[:, 1:]
+    def get_batch(batch_size, seq_len):
+        batch = None
+        seq_len += 1
+
+        while batch is None or batch.size(0) < batch_size:
+            doc = next(data_reader)
+            text = doc.text
+            tokens = tokenizer([text], return_tensors='pt', padding=True, truncation=True)['input_ids'].to(device)
+
+            if tokens.size(1) < seq_len:
+                # pad the tokens to the required sequence length
+                pad = torch.full((1, seq_len - tokens.size(1)), tokenizer.pad_token_id, dtype=torch.long).to(device)
+                tokens = torch.cat([tokens, pad], dim=1)
+            elif tokens.size(1) % seq_len != 0:
+                tokens = tokens[:, :-(len(tokens[0]) % seq_len)]
+            
+            tokens = tokens.view(-1, seq_len)
+
+            if batch is None:
+                # take a subset of the tokens of size batch_size
+                batch = tokens[:batch_size]
+            else:
+                # concatenate the next batch of tokens
+                batch = torch.cat([batch, tokens[:batch_size - batch.size(0)]], dim=0)
+
+
+        x = batch[:, :-1]
+        y = batch[:, 1:]
+
+        x = x.to(device)
+        y = y.to(device)
+
         return x, y
 
-    @torch.no_grad()
-    def estimate_loss(model, train_data, val_data, seq_len=128, batch_size=64):
-        out = {}
-        model.eval()
-        for data in [(train_data, 'train'), (val_data, 'val')]:
-            losses = []
-            for step in range(100):
-                X, Y = get_batch(data[0], batch_size, seq_len)
-                _, loss = model(X, Y)
-                losses.append(loss.item())
+    def train(model, optimizer, scheduler = None, checkpoint_dir = "./checkoints",batch_size=128, seq_len=64, n_steps=50000):
+        losses = [0] * 100
 
-            out[data[1]] = sum(losses) / len(losses)
-
-        idx = torch.tensor([tokenizer.encode("The")], dtype=torch.long, device=device)
-        logits = model.generate(idx, max_new_tokens=50)
-        sample = tokenizer.decode(logits[0].tolist())
-
-        out['sample'] = sample
-
-        model.train()
-        return out
-
-
-    def train(model, optimizer, train_data, test_data, batch_size=32, seq_len=256, n_steps=50000):
-        for step in tqdm(range(n_steps)):
+        for step in tqdm(range(0, n_steps)):
             model.train()
-            X, Y = get_batch(train_data, batch_size, seq_len)
+            X, Y = get_batch(batch_size, seq_len)
 
             logits, loss = model(X, Y)
+            losses[step % 100] = loss.item()
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            
+            if scheduler is not None:
+                scheduler.step()
 
+            if step % 100 == 0 and step > 0:
+
+                denominator = 100 if step > 100 else step
+                train_loss = sum(losses) / denominator
+
+                print(f"Step {step}, loss: {train_loss}")
+            
             if step % 1000 == 0 and step > 0:
-                loss_metrics = estimate_loss(model, train_data, test_data, seq_len=seq_len, batch_size=batch_size)
-                print(f"Step {step}, Train loss: {loss_metrics['train']}, Val loss: {loss_metrics['val']}")
-                print(f"Sample: {loss_metrics['sample']}")
+
+                idx = torch.tensor([tokenizer.encode("This")], dtype=torch.long, device=device)
+                logits = model.generate(idx, max_new_tokens=50)
+                sample = tokenizer.decode(logits[0].tolist())
+
+                print("Sample:\n-------------------")
+                print(sample)
+                # save checkpoint
+                torch.save(model.state_dict(), f'{checkpoint_dir}/model_step_{step}.pth')
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0003)
+    # scheduler = StepLR(optimizer, step_size=1000, gamma=0.1)
+
+    time_stamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    checkpoint_dir = f'checkpoints_{time_stamp}'
+
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+
     try:
-        train(model, optimizer, train_data, test_data, n_steps=50000)
+        train(model, optimizer, None, checkpoint_dir=checkpoint_dir, batch_size=128, seq_len=64, n_steps=50000)
     except KeyboardInterrupt:
-        time_stamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        save_name = f'model_{time_stamp}.pth'
-        print("Training interrupted -- Saving model as ", save_name)
-        torch.save(model.state_dict(), save_name)
+        print("Training interrupted -- Saving model")
+        torch.save(model.state_dict(), f"{checkpoint_dir}/model_interrupted.pth")
         sys.exit()
 
         
@@ -277,14 +332,15 @@ if training:
     torch.save(model.state_dict(), 'model.pth')
 
 else:
-    model = Encoder(vocab_size, 512, 16, 16)
-    model.load_state_dict(torch.load('model.pth'))
+    model = Encoder(vocab_size, 512, 8, 8)
+    model.load_state_dict(torch.load('backup/model_step_25000.pth'))
     model = model.to(device)
 
     # Generate some text
 
-    idx = torch.tensor([tokenizer.encode("This")], dtype=torch.long, device=device)
-    logits = model.generate(idx, max_new_tokens=256)
+    idx = torch.tensor([tokenizer.encode(
+"""A""")], dtype=torch.long, device=device)
+    logits = model.generate(idx, max_new_tokens=64)
     sample = tokenizer.decode(logits[0].tolist())
 
     print(sample)
