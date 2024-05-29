@@ -132,16 +132,52 @@ class EncoderBlock(nn.Module):
         hidden_states = residual + hidden_states
 
         return hidden_states
+    
+
+class SinusoidalPositionalEmbedding(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+
+        self.register_buffer('positional_embedding', self._positional_encoding(d_model))
+    
+    def forward(self, x):
+        return x + self.positional_embedding[:x.size(1)]
+    
+    def _positional_encoding(self, d_model):
+        pe = torch.zeros(AttentionHead.MAX_SEQ_LEN, d_model)
+
+        position = torch.arange(0, AttentionHead.MAX_SEQ_LEN).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * -(torch.log(torch.tensor(10000.0)) / d_model))
+
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        return pe
+
+    
+
+class LearnedPositionalEmbedding(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+
+        self.embedding = nn.Embedding(AttentionHead.MAX_SEQ_LEN, d_model)
+    
+    def forward(self, x):
+        return x + self.embedding.weight[:x.size(1)]
 
 class Encoder(nn.Module):
-    def __init__(self, vocab_size, d_model, n_heads, n_layers):
+    def __init__(self, vocab_size, d_model, n_heads, n_layers, pos_enc_type='sinusoidal'):
         super().__init__()
 
         self.vocab_size = vocab_size
-
         self.embedding = nn.Embedding(vocab_size, d_model)
-        # self.register_buffer('positional_embedding', self._positional_encoding(d_model))
-        self.positional_embedding = nn.Embedding(AttentionHead.MAX_SEQ_LEN, d_model)
+
+        self.pos_enc_type = pos_enc_type
+
+        if self.pos_enc_type == 'sinusoidal':
+            self.positional_embedding = SinusoidalPositionalEmbedding(d_model)
+        elif self.pos_enc_type == 'learned':
+            self.positional_embedding = LearnedPositionalEmbedding(d_model)
 
         self.layers = nn.ModuleList([EncoderBlock(d_model, n_heads) for _ in range(n_layers)])
 
@@ -165,8 +201,9 @@ class Encoder(nn.Module):
         mask = x == 50256
         masked_token_count = mask.sum()
 
-        pos = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1).to(device)
-        x = self.embedding(x) + self.positional_embedding(pos)
+        x = self.embedding(x)   # (batch, seq_len) -> (batch, seq_len, d_model)
+
+        x = self.positional_embedding(x)
 
         # x = self.layers(x, kwargs={'mask': mask})
         for layer in self.layers:
